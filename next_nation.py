@@ -113,6 +113,9 @@ class Building:
     level: int = 1
     hp: int = 10
 
+    def max_level(self) -> int:
+        return HQ_MAX_LEVEL if self.type is BType.HQ else BASE_MAX_LEVEL
+
     def current_hp(self) -> int:
         if self.type is BType.HQ:
             return HQ_LEVELS[self.level].hp
@@ -128,10 +131,13 @@ class Building:
         self.hp = self.current_hp()
 
     def upgrade_cost(self) -> int:
-        if self.type is BType.HQ:
-            return HQ_LEVELS[self.level + 1].upgrade_cost
-        else:
-            return BASE_LEVELS[self.level + 1].cost
+        """다음 레벨로 업그레이드하는 비용. 최대 레벨이면 0 반환 (수리 불가)"""
+        if self.level < self.max_level():
+            if self.type is BType.HQ:
+                return HQ_LEVELS[self.level + 1].upgrade_cost
+            else:
+                return BASE_LEVELS[self.level + 1].cost
+        return 0
 
 
 @dataclass
@@ -293,7 +299,6 @@ def read_turn_start() -> int | None:
 
 
 def read_turn_result(S: GameState, M: GameMap, submitted: Actions) -> None:
-    # ----- 1. 이동·훈련 비용을 턴 시작 전 상태로 미리 계산 -----
     move_cost_total = 0
     for wid, target in submitted.moves:
         b = S.find_building(target)
@@ -301,7 +306,6 @@ def read_turn_result(S: GameState, M: GameMap, submitted: Actions) -> None:
         move_cost_total += cost
     train_cost_total = TRAIN_COST * submitted.train_n
 
-    # ----- 2. 서버 결과 읽기 (순서대로) -----
     line = readln()
     if line == "FINISH":
         sys.exit(0)
@@ -332,15 +336,15 @@ def read_turn_result(S: GameState, M: GameMap, submitted: Actions) -> None:
                     cost = b.upgrade_cost()
                     b.apply_upgrade()
                 else:
-                    cost = HQ_HEAL_COST if b.type == BType.HQ else BASE_HEAL_COST
-                    b.hp = b.current_hp()
+                    # 우리는 수리 명령을 내리지 않으므로 이 분기는 도달하지 않음
+                    pass
                 S.gold -= cost
             else:
                 max_level = HQ_MAX_LEVEL if b.type == BType.HQ else BASE_MAX_LEVEL
                 if b.level < max_level:
                     b.apply_upgrade()
                 else:
-                    b.hp = b.current_hp()
+                    b.hp = b.current_hp()  # 적이 수리한 경우 hp 회복
 
     # ---- TRAIN ----
     t = read_tokens()
@@ -404,11 +408,9 @@ def read_turn_result(S: GameState, M: GameMap, submitted: Actions) -> None:
     # ---- END ----
     readln()
 
-    # ----- 3. 이동·훈련 비용 차감 -----
     S.gold -= move_cost_total
     S.gold -= train_cost_total
 
-    # ----- 4. 수입 및 유지비 -----
     income = 0
     for b in S.buildings.values():
         if b.side is not M.my_side:
@@ -452,7 +454,6 @@ def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
     enemy_warriors = [w for w in S.warriors if w.id.side == opp]
     enemy_hq = next(b for b in S.buildings.values() if b.side == opp and b.type == BType.HQ)
 
-    # 지역별 전사 그룹화
     my_warriors_by_region: dict[int, list[Warrior]] = defaultdict(list)
     for w in my_warriors:
         my_warriors_by_region[w.region].append(w)
@@ -481,7 +482,6 @@ def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
         b = S.find_building(region)
         return b is not None and b.side == my
 
-    # 비용 추적
     total_cost = 0
     move_costs: list[int] = []
     upgrade_costs: list[int] = []
@@ -510,7 +510,6 @@ def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
             a.upgrades.pop()
             total_cost -= upgrade_costs.pop()
 
-    # 예산 초과 시 마지막 명령부터 제거
     def enforce_budget() -> None:
         nonlocal total_cost
         while total_cost > S.gold:
@@ -532,13 +531,11 @@ def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
     moved_ids: set[WarriorId] = set()
     upgrade_set: set[int] = set()
 
-    # ---------- 기초 전력 평가 ----------
     my_military = sum(w.hp for w in my_warriors)
     enemy_military = sum(w.hp for w in enemy_warriors)
     dist_between_hqs = P.hop[my_hq_reg][opp_hq_reg]
     THREAT_DIST = max(5, min(12, dist_between_hqs // 3))
 
-    # ---------- 전략 결정 ----------
     if my_warriors:
         main_army_region = max(my_warriors_by_region.keys(), key=lambda r: len(my_warriors_by_region[r]))
         our_main_dist_to_opp_hq = P.hop[main_army_region][opp_hq_reg]
@@ -611,12 +608,7 @@ def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
                     add_move(w.id, my_hq_reg, MOVE_COST)
                     moved_ids.add(w.id)
 
-        if my_hq.hp < my_hq.current_hp() * 0.6:
-            cost = HQ_HEAL_COST
-            if gold >= cost and friendly_present(my_hq_reg) and not enemy_present(my_hq_reg) and my_hq_reg not in upgrade_set:
-                add_upgrade(my_hq_reg, cost)
-                upgrade_set.add(my_hq_reg)
-                gold -= cost
+        # 수리 로직 제거됨
 
         train_cap = HQ_LEVELS[my_hq.level].train_cap
         max_train = min(train_cap, gold // TRAIN_COST)
@@ -628,7 +620,7 @@ def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
         return a
 
     # ---------- ECON 모드 (평시) ----------
-    # ★★★ 본부 업그레이드 최우선 ★★★
+    # 본부 업그레이드 최우선
     if my_hq.level < 5:
         cost_next = HQ_LEVELS[my_hq.level + 1].upgrade_cost
         if gold >= cost_next and friendly_present(my_hq_reg) and not enemy_present(my_hq_reg):
@@ -695,14 +687,7 @@ def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
                         gold -= cost
                         break
 
-    # 3. 수리
-    for b in my_buildings:
-        if b.hp < b.current_hp() * 0.4:
-            cost = HQ_HEAL_COST if b.type == BType.HQ else BASE_HEAL_COST
-            if gold >= cost and friendly_present(b.region) and not enemy_present(b.region) and b.region not in upgrade_set:
-                add_upgrade(b.region, cost)
-                upgrade_set.add(b.region)
-                gold -= cost
+    # 3. 수리 로직 완전 제거
 
     # 4. 일꾼 배치
     for b in my_buildings:
@@ -827,15 +812,7 @@ def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
                     total_cost += train_n * TRAIN_COST
                     gold -= train_n * TRAIN_COST
 
-    # 본부 최대 레벨 시 수리
-    if my_hq.level == 5 and my_hq.hp < my_hq.current_hp() * 0.8:
-        cost = HQ_HEAL_COST
-        if gold >= cost and friendly_present(my_hq_reg) and not enemy_present(my_hq_reg) and my_hq_reg not in upgrade_set:
-            add_upgrade(my_hq_reg, cost)
-            upgrade_set.add(my_hq_reg)
-            gold -= cost
 
-    # ========== 최종 예산 초과 조정 ==========
     enforce_budget()
     return a
 
