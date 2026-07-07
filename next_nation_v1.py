@@ -452,7 +452,6 @@ def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
         return a
 
     my_hq = next(b for b in my_buildings if b.type == BType.HQ)
-    my_bases = [b for b in my_buildings if b.type == BType.BASE]
     enemy_warriors = [w for w in S.warriors if w.id.side == opp]
 
     my_warriors_by_region: dict[int, list[Warrior]] = defaultdict(list)
@@ -466,17 +465,6 @@ def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
 
     own_regions_set = {b.region for b in my_buildings}
 
-    # ── Complete annihilation emergency ──
-    if len(my_warriors) == 0:
-        if S.gold >= TRAIN_COST:
-            a.train_n = 1
-        total_cost = a.train_n * TRAIN_COST
-        while total_cost > S.gold:
-            a.train_n -= 1
-            total_cost -= TRAIN_COST
-        return a
-
-    # ── Helper functions ──
     def stationary_at(region: int) -> list[Warrior]:
         return [w for w in my_warriors_by_region.get(region, []) if w.state == WState.STATIONARY]
 
@@ -506,18 +494,6 @@ def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
         upgrade_costs.append(cost)
         total_cost += cost
 
-    def pop_move() -> None:
-        nonlocal total_cost
-        if a.moves:
-            a.moves.pop()
-            total_cost -= move_costs.pop()
-
-    def pop_upgrade() -> None:
-        nonlocal total_cost
-        if a.upgrades:
-            a.upgrades.pop()
-            total_cost -= upgrade_costs.pop()
-
     def enforce_budget() -> None:
         nonlocal total_cost
         while total_cost > S.gold:
@@ -525,9 +501,11 @@ def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
                 a.train_n -= 1
                 total_cost -= TRAIN_COST
             elif a.moves:
-                pop_move()
+                a.moves.pop()
+                total_cost -= move_costs.pop()
             elif a.upgrades:
-                pop_upgrade()
+                a.upgrades.pop()
+                total_cost -= upgrade_costs.pop()
             else:
                 a.train_n = 0
                 a.moves.clear()
@@ -536,9 +514,58 @@ def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
                 break
 
     moved_ids: set[WarriorId] = set()
-    upgrade_set: set[int] = set()
 
-    # ── 0순위: 방어 (언제나 적용) ──
+    # ================================================================
+    # [1순위] 적 병력 2명 이상이 맵 절반(우리 진영)에 들어왔을 때 방어 집결
+    # ================================================================
+    rush_detected = False
+    for region, cnt in enemy_count_by_region.items():
+        if cnt >= 2:
+            # 그 구역이 상대 본부보다 우리 본부에 더 가까우면 우리 진영으로 간주
+            if P.hop[region][my_hq_reg] < P.hop[region][opp_hq_reg]:
+                rush_detected = True
+                break
+
+    if rush_detected:
+        # --- 방어 모드: 노동 인원만 남기고 전 병력 본부로 집결 ---
+        for b in my_buildings:
+            region = b.region
+            cap = b.work_cap()
+            workers = stationary_at(region)
+            # 정원 초과 인원을 본부로 이동
+            for w in workers[cap:]:
+                if w.id not in moved_ids and can_move_now(w):
+                    add_move(w.id, my_hq_reg, 0)
+                    moved_ids.add(w.id)
+
+        # 건물이 없는 지역에 고립된 병력도 본부로 귀환
+        for w in my_warriors:
+            if w.region not in own_regions_set and w.state == WState.STATIONARY:
+                if w.id not in moved_ids and can_move_now(w):
+                    add_move(w.id, my_hq_reg, 0)
+                    moved_ids.add(w.id)
+
+        # 본부 업그레이드 (가능하면)
+        if my_hq.level < HQ_MAX_LEVEL:
+            cost = HQ_LEVELS[my_hq.level + 1].upgrade_cost
+            if (total_cost + cost <= S.gold and
+                workers_now(my_hq_reg) >= 1 and
+                my_hq_reg not in enemy_present_set):
+                add_upgrade(my_hq_reg, cost)
+
+        # 남는 금화로 최대한 전사 훈련
+        train_cap = HQ_LEVELS[my_hq.level].train_cap
+        max_train = min(train_cap, (S.gold - total_cost) // TRAIN_COST)
+        if max_train > 0:
+            a.train_n = max_train
+            total_cost += max_train * TRAIN_COST
+
+        enforce_budget()
+        return a
+
+    # ================================================================
+    # [2순위] 평시 거점 방어: 공격받는 건물에 잉여 병력 지원
+    # ================================================================
     attacked_buildings = [b for b in my_buildings if enemy_count_by_region[b.region] > 0]
     if attacked_buildings:
         attacked_buildings.sort(key=lambda b: (b.type != BType.HQ, -b.level))
@@ -546,9 +573,12 @@ def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
             target_region = target_b.region
             enemy_cnt = enemy_count_by_region[target_region]
             is_hq = target_b.type == BType.HQ
+
             if workers_now(target_region) >= enemy_cnt:
                 continue
+
             if is_hq:
+                # 본부 방어 시에는 모든 건물의 잉여 병력을 동원
                 pool = []
                 for b in my_buildings:
                     pool.extend(stationary_at(b.region))
@@ -557,12 +587,12 @@ def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
                 for w in pool:
                     if w.region == target_region:
                         continue
-                    cost = 0
-                    if total_cost + cost > S.gold:
+                    if total_cost + 0 > S.gold:
                         continue
-                    add_move(w.id, target_region, cost)
+                    add_move(w.id, target_region, 0)
                     moved_ids.add(w.id)
             else:
+                # 기지 방어: work_cap을 초과하는 잉여 병력만 차출
                 needed = enemy_cnt - workers_now(target_region)
                 if needed <= 0:
                     continue
@@ -579,31 +609,23 @@ def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
                         break
                     if w.region == target_region:
                         continue
-                    cost = 0
-                    if total_cost + cost > S.gold:
+                    if total_cost + 0 > S.gold:
                         continue
-                    add_move(w.id, target_region, cost)
+                    add_move(w.id, target_region, 0)
                     moved_ids.add(w.id)
                     sent += 1
 
-    # ── 확장 완료 상태 업데이트 ──
+    # ================================================================
+    # [3순위] 초반 확장 모드 (기존 로직)
+    # ================================================================
+    my_bases = [b for b in my_buildings if b.type == BType.BASE]
     MAX_BASES = 2
     if not S.early_expansion_done and len(my_bases) >= MAX_BASES:
         S.early_expansion_done = True
 
-    # ================================================================
-    # 초기 확장 모드: 거점 2개 확보까지 훈련 없이 신속 확장
-    # [패치] HQ 방어 훈련 예외와 "확장 정체" 훈련 예외를 분리한다.
-    #   - 이전 버전은 두 조건을 하나(can_expand)로 묶어버려서,
-    #     확장지로 이동 중인 전사가 하나라도 있으면(=거의 항상 있음)
-    #     HQ가 완전히 비어 있어도 훈련이 막히는 문제가 있었다.
-    #   - 이제는 "HQ가 비었는가"와 "확장이 정체됐는가"를 독립적으로 체크해
-    #     둘 중 하나만 만족해도 소액 훈련을 허용한다.
-    # ================================================================
     if not S.early_expansion_done:
         unclaimed = [s for s in M.strongholds if S.find_building(s) is None]
 
-        # 확장 목표 관리
         S.expansion_targets = [t for t in S.expansion_targets if (b := S.find_building(t)) is None or b.side == my]
         while len(S.expansion_targets) < MAX_BASES and unclaimed:
             candidates = [s for s in unclaimed if s not in S.expansion_targets]
@@ -617,7 +639,6 @@ def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
 
         targets = S.expansion_targets
 
-        # 이동 명령: 거점에 전사 보내기
         for target in targets:
             if S.find_building(target) is not None:
                 continue
@@ -635,19 +656,13 @@ def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
                 add_move(w.id, target, MOVE_COST)
                 moved_ids.add(w.id)
 
-        # 건설 명령
         for s in targets:
             if workers_now(s) > 0 and not enemy_count_by_region[s] and S.find_building(s) is None:
                 if total_cost + BASE_LEVELS[1].cost <= S.gold:
                     add_upgrade(s, BASE_LEVELS[1].cost)
 
-        # --- [패치] 훈련 예외 조건 분리 ---
         a.train_n = 0
-
-        # 조건 A: HQ 구역에 방어 인력이 실제로 0명인가 (가장 중요한 안전장치)
         hq_undefended = workers_now(my_hq_reg) == 0
-
-        # 조건 B: 확장 자체가 완전히 정체됐는가 (보낼 인력도, 이동 중인 인력도 없음)
         moving_to_target = any(w.state == WState.MOVING and w.target in targets for w in my_warriors)
         idle_workers = []
         for b in my_buildings:
@@ -656,8 +671,6 @@ def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
 
         if (hq_undefended or expansion_stalled) and S.gold - total_cost >= TRAIN_COST:
             train_cap = HQ_LEVELS[my_hq.level].train_cap
-            # HQ가 완전히 비었다면 방어를 위해 좀 더 넉넉히,
-            # 단순 정체 상황이면 최소 1명만 훈련해 골드 낭비를 줄인다.
             if hq_undefended:
                 a.train_n = min(train_cap, (S.gold - total_cost) // TRAIN_COST)
             else:
@@ -667,7 +680,7 @@ def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
         return a
 
     # ================================================================
-    # 후반 운영 (확장 완료 후) – 훈련, 공격, 거점 재건 모두 자유롭게
+    # [4순위] 후반 운영 모드 (기존 로직)
     # ================================================================
     frontline_region = min(my_buildings, key=lambda b: P.hop[b.region][opp_hq_reg]).region
 
@@ -675,17 +688,15 @@ def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
     if my_hq.level < HQ_MAX_LEVEL:
         cost = HQ_LEVELS[my_hq.level + 1].upgrade_cost
         if (total_cost + cost <= S.gold and workers_now(my_hq_reg) > 0
-                and not enemy_count_by_region[my_hq_reg] and my_hq_reg not in upgrade_set):
+                and not enemy_count_by_region[my_hq_reg] and my_hq_reg not in set(a.upgrades)):
             add_upgrade(my_hq_reg, cost)
-            upgrade_set.add(my_hq_reg)
     else:
         for b in my_bases:
             if b.level < BASE_MAX_LEVEL:
                 cost = BASE_LEVELS[b.level + 1].cost
                 if (total_cost + cost <= S.gold and workers_now(b.region) >= b.work_cap()
-                        and not enemy_count_by_region[b.region] and b.region not in upgrade_set):
+                        and not enemy_count_by_region[b.region] and b.region not in set(a.upgrades)):
                     add_upgrade(b.region, cost)
-                    upgrade_set.add(b.region)
                     break
 
     # 노동 인력 배치
@@ -722,15 +733,16 @@ def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
         ]
         if not enemy_strongholds:
             return opp_hq_reg
-        if len(enemy_strongholds) == 1:
-            return enemy_strongholds[0]
+        
         enemy_strongholds.sort(key=lambda s: (
-            enemy_count_by_region[s],
-            -P.hop[s][opp_hq_reg]
+            P.hop[from_region][s],
+            enemy_count_by_region[s]
         ))
         for target in enemy_strongholds:
             defenders = enemy_count_by_region[target]
             if len(attackers) > defenders * 1.5:
+                if P.nxt[from_region][target] == opp_hq_reg:
+                    continue
                 return target
         return None
 
@@ -791,7 +803,7 @@ def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
             add_move(w.id, frontline_region, 0)
             moved_ids.add(w.id)
 
-    # ── 거점 재건 (파괴된 경우) ──
+    # 거점 재건
     if len(my_bases) < MAX_BASES:
         unclaimed = [s for s in M.strongholds if S.find_building(s) is None]
         S.expansion_targets = [t for t in S.expansion_targets if (b := S.find_building(t)) is None or b.side == my]
