@@ -1,6 +1,6 @@
 # NYPC MASTER TRACK — NEXT NATION
 
-> ### 🏆 최종 순위 **53위 / 937팀** (상위 약 5.7%)
+> ### 🏆 최종 순위 **53위 / 1603팀** (상위 약 3.3%)
 
 [NYPC](https://new.nypc.co.kr) 대전 게임 NEXT NATION 문제에 제출한 Python 기반 자동 플레이어입니다.
 
